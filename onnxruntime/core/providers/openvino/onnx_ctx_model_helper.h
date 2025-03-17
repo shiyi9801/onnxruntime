@@ -33,6 +33,7 @@ class EPCtxHandler {
                                std::string&& model_blob_str) const;
   std::unique_ptr<std::istream> GetModelBlobStream(const std::filesystem::path& so_context_file_path, const GraphViewer& graph_viewer) const;
   InlinedVector<const Node*> GetEPCtxNodes() const;
+  Status ExportEPCtxModelToStringBuffer(char** out, size_t* out_size);
 
  private:
   const std::string openvino_sdk_version_;

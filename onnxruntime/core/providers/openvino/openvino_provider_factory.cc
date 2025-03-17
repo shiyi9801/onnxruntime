@@ -24,7 +24,8 @@ void ParseConfigOptions(ProviderInfo& pi, const ConfigOptions& config_options) {
 
 void* ParseUint64(const ProviderOptions& provider_options, std::string option_name) {
   if (provider_options.contains(option_name)) {
-    uint64_t number = std::strtoull(provider_options.at(option_name).data(), nullptr, 16);
+    uint64_t number = std::strtoull(provider_options.at(option_name).data(), nullptr, 10);
+    LOGS_DEFAULT(WARNING) << "number = " << number;
     return reinterpret_cast<void*>(number);
   } else {
     return nullptr;
@@ -319,6 +320,13 @@ struct OpenVINO_Provider : Provider {
         LOGS_DEFAULT(WARNING) << "[OpenVINO-EP] The value for the key 'num_streams' should be in the range of 1-8.\n "
                               << "Executing with num_streams=1";
       }
+    }
+    if (provider_options.contains("export_compiled_model_buffer") &&
+        provider_options.contains("export_compiled_model_buffer_size")) {
+      pi.export_compiled_model_buffer =
+          reinterpret_cast<char**>(ParseUint64(provider_options, "export_compiled_model_buffer"));
+      pi.export_compiled_model_buffer_size =
+          reinterpret_cast<size_t*>(ParseUint64(provider_options, ("export_compiled_model_buffer_size")));
     }
     pi.enable_opencl_throttling = ParseBooleanOption(provider_options, "enable_opencl_throttling");
 

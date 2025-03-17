@@ -780,9 +780,9 @@ static Status CreateEpContextModel(const ExecutionProviders& execution_providers
     ini_size_threshold = 0;
     external_ini_path = ep_context_ext_ini_path;
   }
-  ModelSavingOptions model_saving_options{ini_size_threshold};
-  ORT_RETURN_IF_ERROR(Model::SaveWithExternalInitializers(ep_context_model, context_cache_path,
-                                                          external_ini_path, model_saving_options));
+  // ModelSavingOptions model_saving_options{ini_size_threshold};
+  // ORT_RETURN_IF_ERROR(Model::SaveWithExternalInitializers(ep_context_model, context_cache_path,
+  //                                                         external_ini_path, model_saving_options));
 
   return Status::OK();
 }

@@ -39,6 +39,26 @@ Status EPCtxHandler::ExportEPCtxModel(const std::string& model_name) {
   return Status::OK();
 }
 
+Status EPCtxHandler::ExportEPCtxModelToStringBuffer(char** out, size_t* out_size) {
+  // Serialize modelproto to string
+  auto model_proto = epctx_model_->ToProto();
+  model_proto->set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+
+  std::string model_str;
+  if (!model_proto->SerializeToString(model_str)) {
+    LOGS_DEFAULT(WARNING) << "[OpenVINO-EP] Failed to serialize model proto to string! \n";
+  }
+  char* model_buffer = new char[model_str.length() + 1];
+  std::copy(model_str.begin(), model_str.end(), model_buffer);
+  model_buffer[model_str.length()] = '\0';
+
+  *out = model_buffer;
+  model_buffer = nullptr;
+  *out_size = model_str.length();
+
+  return Status::OK();
+}
+
 Status EPCtxHandler::AddOVEPCtxNodeToGraph(const GraphViewer& graph_viewer,
                                            const std::string& graph_name,
                                            const bool embed_mode,

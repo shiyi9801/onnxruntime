@@ -194,6 +194,11 @@ BackendManager::BackendManager(SessionContext& session_context,
     if ((!status.IsOK())) {
       ORT_THROW(status);
     }
+    status = ep_ctx_handle_.ExportEPCtxModelToStringBuffer(session_context.export_compiled_model_buffer,
+                                                           session_context.export_compiled_model_buffer_size);
+    if ((!status.IsOK())) {
+      ORT_THROW(status);
+    }
   }
 }
 

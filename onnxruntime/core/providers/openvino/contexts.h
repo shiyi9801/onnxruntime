@@ -101,6 +101,8 @@ struct ProviderInfo {
   bool so_context_embed_mode{false};       // ORT session option
   bool so_share_ep_contexts{false};        // ORT session option
   fs::path so_context_file_path{};         // ORT session option
+  char** export_compiled_model_buffer{nullptr};
+  size_t* export_compiled_model_buffer_size{nullptr};
 };
 
 // Holds context applicable to the entire EP instance.
