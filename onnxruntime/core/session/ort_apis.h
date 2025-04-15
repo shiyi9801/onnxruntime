@@ -549,4 +549,5 @@ ORT_API_STATUS_IMPL(CreateTensorWithDataAndDeleterAsOrtValue, _In_ OrtAllocator*
                     ONNXTensorElementDataType type,
                     _Outptr_ OrtValue** out);
 
+ORT_API_STATUS_IMPL(SaveEpContextModel, _Inout_ OrtSession* sess, _In_ const char* ep_context_path);
 }  // namespace OrtApis

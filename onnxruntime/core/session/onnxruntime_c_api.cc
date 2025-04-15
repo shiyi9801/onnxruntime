@@ -2412,6 +2412,17 @@ ORT_API(const OrtModelEditorApi*, OrtApis::GetModelEditorApi) {
 #endif
 }
 
+ORT_API_STATUS_IMPL(OrtApis::SaveEpContextModel, _Inout_ OrtSession* sess, _In_ const char* ep_context_path) {
+  API_IMPL_BEGIN
+  auto session = reinterpret_cast<::onnxruntime::InferenceSession*>(sess);
+
+  Status status;
+  status = session->SaveEpContextModel(ep_context_path);
+
+  return ToOrtStatus(status);
+  API_IMPL_END
+}
+
 static constexpr OrtApiBase ort_api_base = {
     &OrtApis::GetApi,
     &OrtApis::GetVersionString};
@@ -2810,6 +2821,8 @@ static constexpr OrtApi ort_api_1_to_22 = {
     &OrtApis::GetModelEditorApi,
 
     &OrtApis::CreateTensorWithDataAndDeleterAsOrtValue,
+
+    &OrtApis::SaveEpContextModel,
 };
 
 // OrtApiBase can never change as there is no way to know what version of OrtApiBase is returned by OrtGetApiBase.

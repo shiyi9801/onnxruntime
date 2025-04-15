@@ -2271,6 +2271,20 @@ common::Status InferenceSession::Initialize() {
 #pragma warning(pop)
 #endif
 
+[[nodiscard]] common::Status InferenceSession::SaveEpContextModel(std::string ep_context_path) {
+  onnxruntime::Graph& graph = model_->MainGraph();
+
+  // Check before EP compile graphs
+  std::filesystem::path context_cache_path;
+  ORT_RETURN_IF_ERROR(
+      GraphPartitioner::GetValidatedEpContextPath(ep_context_path, graph.ModelPath(), context_cache_path));
+
+  ORT_RETURN_IF_ERROR(GraphPartitioner::CreateEpContextModel(execution_providers_, graph, ep_context_path,
+                                                             /*external_ini_file_name=*/"", *session_logger_));
+
+  return common::Status::OK();
+}
+
 int InferenceSession::GetCurrentNumRuns() const {
   return current_num_runs_.load();
 }

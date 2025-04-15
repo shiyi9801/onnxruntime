@@ -355,6 +355,8 @@ class InferenceSession {
    */
   [[nodiscard]] common::Status Initialize();
 
+  [[nodiscard]] common::Status SaveEpContextModel(std::string ep_context_path);
+
   [[nodiscard]] common::Status SetEpDynamicOptions(gsl::span<const char* const> keys,
                                                    gsl::span<const char* const> values);
 

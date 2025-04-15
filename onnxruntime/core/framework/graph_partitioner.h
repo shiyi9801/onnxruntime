@@ -29,6 +29,16 @@ class GraphPartitioner {
         providers_(providers) {
   }
 
+  static Status GetValidatedEpContextPath(const std::filesystem::path& ep_context_path,
+    const std::filesystem::path& model_path,
+    std::filesystem::path& context_cache_path);
+
+  static Status CreateEpContextModel(const ExecutionProviders& execution_providers,
+    const Graph& graph,
+    const std::filesystem::path& ep_context_path,
+    const std::filesystem::path& ep_context_ext_ini_path,
+    const logging::Logger& logger);
+
   // Run partitioning.
   Status Partition(Graph& graph, FuncManager& func_mgr,
                    const layout_transformation::TransformLayoutFunction& transform_layout_function,

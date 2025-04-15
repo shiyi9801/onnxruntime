@@ -667,7 +667,7 @@ static Status InlineFunctionsAOTImpl(const ExecutionProviders& execution_provide
 }
 
 // Validate the ep_context_path to make sure it is file path and check whether the file exist already
-static Status GetValidatedEpContextPath(const std::filesystem::path& ep_context_path,
+Status GraphPartitioner::GetValidatedEpContextPath(const std::filesystem::path& ep_context_path,
                                         const std::filesystem::path& model_path,
                                         std::filesystem::path& context_cache_path) {
   if (!ep_context_path.empty()) {
@@ -694,11 +694,14 @@ static Status GetValidatedEpContextPath(const std::filesystem::path& ep_context_
   return Status::OK();
 }
 
-static Status CreateEpContextModel(const ExecutionProviders& execution_providers,
+Status GraphPartitioner::CreateEpContextModel(const ExecutionProviders& execution_providers,
                                    const Graph& graph,
                                    const std::filesystem::path& ep_context_path,
                                    const std::filesystem::path& ep_context_ext_ini_path,
                                    const logging::Logger& logger) {
+    LOGS(logger, ERROR) << "ep_context_path: " << ep_context_path;
+    LOGS(logger, ERROR) << "ep_context_ext_ini_path: " << ep_context_ext_ini_path;
+
   InlinedVector<const Node*> all_ep_context_nodes;
   for (const auto& ep : execution_providers) {
     const InlinedVector<const Node*> ep_context_nodes = ep->GetEpContextNodes();
