@@ -318,7 +318,10 @@ static OrtStatus* CreateSessionAndLoadSingleModelImpl(_In_ const OrtSessionOptio
       ORT_API_RETURN_IF_STATUS_NOT_OK(GetCustomOpDomainsFromEpDevice(*ep_device, domains));
 
       for (auto domain : domains) {
-        if (ShouldAddDomain(domain, options->custom_op_domains_)) {
+        // Multiple EP devices can expose the same custom-op domain. Keep one copy
+        // in this session's collection before its custom registry is created.
+        if (ShouldAddDomain(domain, options->custom_op_domains_) &&
+            !DoesDomainWithNameExist(domain->domain_, all_ep_custom_op_domains)) {
           all_ep_custom_op_domains.push_back(domain);
         }
       }
@@ -431,7 +434,10 @@ static OrtStatus* CreateSessionAndLoadModelImpl(_In_ const OrtSessionOptions* op
       ORT_API_RETURN_IF_STATUS_NOT_OK(GetCustomOpDomainsFromEpDevice(*ep_device, domains));
 
       for (auto domain : domains) {
-        if (ShouldAddDomain(domain, options->custom_op_domains_)) {
+        // Multiple EP devices can expose the same custom-op domain. Keep one copy
+        // in this session's collection before its custom registry is created.
+        if (ShouldAddDomain(domain, options->custom_op_domains_) &&
+            !DoesDomainWithNameExist(domain->domain_, all_ep_custom_op_domains)) {
           all_ep_custom_op_domains.push_back(domain);
         }
       }
@@ -610,8 +616,36 @@ Status CompileModel(const Environment& env, const ModelCompilationOptions& model
 
   const Telemetry& telemetry_provider = Env::Default().GetTelemetryProvider();
 
+  OrtSessionOptions staged_session_options = model_compile_options.GetSessionOptions();
+  auto& gen_options = staged_session_options.value.ep_context_gen_options;
+  const auto* external_output =
+      model_compile_options.GetSessionOptions().value.ep_context_gen_options.TryGetExternalInitializerBufferInfo();
+  const auto* model_output =
+      model_compile_options.GetSessionOptions().value.ep_context_gen_options.TryGetOutputModelBuffer();
+  void* external_buffer = nullptr;
+  size_t external_size = 0;
+  void* model_buffer = nullptr;
+  size_t model_size = 0;
+  auto free_pending_buffers = gsl::finally([&]() {
+    if (external_buffer) external_output->buffer_allocator->Free(external_buffer);
+    if (model_buffer) model_output->buffer_allocator->Free(model_buffer);
+  });
+
+  // Saving the model and subsequent session validation can fail after initializers have been serialized.
+  // Stage both allocations until the entire CompileModel call succeeds, including for EPContext models.
+  if (external_output) {
+    auto& staged_output = std::get<epctx::ExternalInitializerBufferInfo>(gen_options.initializers_location);
+    staged_output.buffer_ptr = &external_buffer;
+    staged_output.buffer_size_ptr = &external_size;
+  }
+  if (model_output) {
+    auto& staged_output = std::get<epctx::BufferHolder>(gen_options.output_model_location);
+    staged_output.buffer_ptr = &model_buffer;
+    staged_output.buffer_size_ptr = &model_size;
+  }
+
   std::unique_ptr<onnxruntime::InferenceSession> session;
-  const OrtSessionOptions* session_options = &model_compile_options.GetSessionOptions();
+  const OrtSessionOptions* session_options = &staged_session_options;
 
   Status status;
 
@@ -663,6 +697,17 @@ Status CompileModel(const Environment& env, const ModelCompilationOptions& model
       status.IsOK() ? 0 : static_cast<uint32_t>(status.Category()),
       status.IsOK() ? "" : status.ErrorMessage());
 
+  if (status.IsOK()) {
+    if (external_output) {
+      *external_output->buffer_ptr = std::exchange(external_buffer, nullptr);
+      *external_output->buffer_size_ptr = external_size;
+    }
+    if (model_output) {
+      *model_output->buffer_ptr = std::exchange(model_buffer, nullptr);
+      *model_output->buffer_size_ptr = model_size;
+    }
+  }
+
   return status;
 }
 
@@ -683,7 +728,13 @@ Status LoadPluginOrProviderBridge(const std::string& registration_name,
   auto provider_library = std::make_unique<ProviderLibrary>(resolved_library_path.native().c_str(),
                                                             true,
                                                             ProviderLibraryPathType::Absolute);
-  bool is_provider_bridge = provider_library->Load() == Status::OK();  // library has GetProvider
+  auto unload_probe = gsl::finally([&]() {
+    if (provider_library) {
+      provider_library->Unload();
+    }
+  });
+  // Keep a plugin DLL initialized until EpLibraryPlugin holds its own reference.
+  bool is_provider_bridge = provider_library->Load(/*retain_library_on_missing_get_provider=*/true).IsOK();
   LOGS_DEFAULT(INFO) << "Loading EP library: " << resolved_library_path
                      << (is_provider_bridge ? " as a provider bridge" : " as a plugin");
 
@@ -800,7 +851,7 @@ Status PrintAvailableAndSelectedEpInfos(const Environment& env, std::vector<Vari
     }
   }
 
-  std::string selected_eps_info = "Selected EPs:\n";
+  std::string selected_eps_info = "EPs for variant selection, in priority order:\n";
   if (ep_infos.empty()) {
     selected_eps_info += "  (none)\n";
   } else {
@@ -821,55 +872,41 @@ Status PrintAvailableAndSelectedEpInfos(const Environment& env, std::vector<Vari
   return Status::OK();
 }
 
-// Gets EP info needed for model package workflow to select suitable model.
-//
-// For simplicity, there are some constraints in this initial implementation:
-// - Only one EP is supported, skip ORT CPU EP.
-// - All devices should be supported by the same EP
-//
-Status GetVariantSelectionEpInfo(std::vector<std::unique_ptr<IExecutionProvider>>& provider_list,
+// Gets EP information for model variant selection: one entry for each non-null provider in provider_list.
+// Entries preserve provider order, which determines EP priority. All devices in an entry belong to the same EP.
+Status GetVariantSelectionEpInfo(gsl::span<const std::unique_ptr<IExecutionProvider>> provider_list,
+                                 gsl::span<const std::shared_ptr<IExecutionProviderFactory>> provider_factories,
                                  std::vector<VariantSelectionEpInfo>& ep_infos) {
-  if (provider_list.empty()) {
-    return Status::OK();
-  }
-
-  // Use the first provider in the list for variant selection.
-  auto& provider = provider_list[0];
-  if (!provider) {
-    return Status::OK();
-  }
-
-  ep_infos.push_back(VariantSelectionEpInfo{});
-  auto& ep_info = ep_infos.back();
-
-  // Add ep name to ep_info
-  ep_info.ep_name = provider->Type();
-  ORT_ENFORCE(!ep_info.ep_name.empty(), "EP name should have been set at this point.");
-
-  // CPU is built-in and needs no device/factory metadata for variant selection.
-  if (ep_info.ep_name == onnxruntime::kCpuExecutionProvider) {
-    return Status::OK();
-  }
-
-  // Add ep devices to ep_info
-  auto& ep_devices = provider->GetEpDevices();
-  ep_info.ep_devices = ep_devices;
-
-  // Add ep factory to ep_info
-  ep_info.ep_factory = ep_devices.empty() ? nullptr : ep_devices.front()->ep_factory;
-
-  // Add hardware devices to ep_info
-  ep_info.hardware_devices.reserve(ep_devices.size());
-  for (const auto& ep_device : ep_devices) {
-    if (ep_device->device != nullptr) {
-      ep_info.hardware_devices.push_back(ep_device->device);
+  ORT_ENFORCE(provider_factories.empty() || provider_factories.size() == provider_list.size(),
+              "Expected one provider factory for each provider.");
+  for (size_t i = 0; i < provider_list.size(); ++i) {
+    const auto& provider = provider_list[i];
+    if (!provider) {
+      continue;
     }
-  }
 
-  // Add ep metadata to ep_info
-  ep_info.ep_metadata.reserve(ep_devices.size());
-  for (const auto& ep_device : ep_devices) {
-    ep_info.ep_metadata.push_back(&ep_device->ep_metadata);
+    VariantSelectionEpInfo& ep_info = ep_infos.emplace_back();
+    ep_info.ep_name = provider->Type();
+    ORT_ENFORCE(!ep_info.ep_name.empty(), "EP name should have been set at this point.");
+    if (!provider_factories.empty()) {
+      ep_info.provider_factory = provider_factories[i];
+    }
+
+    ep_info.ep_devices = provider->GetEpDevices();
+    const auto& ep_devices = ep_info.ep_devices;
+    ep_info.ep_factory = ep_devices.empty() ? nullptr : ep_devices.front()->ep_factory;
+
+    ep_info.hardware_devices.reserve(ep_devices.size());
+    for (const auto& ep_device : ep_devices) {
+      if (ep_device->device != nullptr) {
+        ep_info.hardware_devices.push_back(ep_device->device);
+      }
+    }
+
+    ep_info.ep_metadata.reserve(ep_devices.size());
+    for (const auto& ep_device : ep_devices) {
+      ep_info.ep_metadata.push_back(&ep_device->ep_metadata);
+    }
   }
 
   return Status::OK();
@@ -877,14 +914,9 @@ Status GetVariantSelectionEpInfo(std::vector<std::unique_ptr<IExecutionProvider>
 
 // Create session for model package workflow.
 //
-// Preconditions: caller has already
-//   1. resolved EP selection  -> provider_list (owns the IExecutionProvider instances),
-//   2. selected a model variant -> selected_model_path.
-//
-// This function:
-//   a. creates and loads an InferenceSession for selected_model_path,
-//   b. registers the providers from provider_list (moves them into the session),
-//   c. optionally logs auto-EP-selection telemetry when from_policy is true.
+// The caller configures provider factories and custom operator domains before loading the model.
+// Register EPs and check that the selected EP is present before initialization, so its absence is reported
+// instead of a later initialization error.
 OrtStatus* CreateSessionForModelPackage(_In_ const OrtSessionOptions* options,
                                         const onnxruntime::Environment& env,
                                         const std::filesystem::path& selected_model_path,
@@ -908,25 +940,15 @@ OrtStatus* CreateSessionForModelPackage(_In_ const OrtSessionOptions* options,
                                                               /*model_data_length*/ 0,
                                                               sess));
 
-  // Providers were created earlier from the original options; rebuild now so
-  // any merged variant-specific provider options take effect.
-  ORT_API_RETURN_IF_STATUS_NOT_OK(model_package_context.RebuildProviderListForSession(env, *options_to_use));
+  ORT_API_RETURN_IF_STATUS_NOT_OK(CreateAndRegisterExecutionProviders(options_to_use, *sess));
 
-  auto& provider_list = model_package_context.MutableProviderList();
-
-  for (auto& provider : provider_list) {
-    if (provider) {
-      ORT_API_RETURN_IF_STATUS_NOT_OK(sess->RegisterExecutionProvider(std::move(provider)));
-    }
-  }
-
-  if (model_package_context.IsFromPolicy()) {
-    ProviderPolicyContext provider_policy_context;
-    ORT_API_RETURN_IF_STATUS_NOT_OK(provider_policy_context.LogTelemetry(
-        *sess, *options_to_use,
-        model_package_context.ExecutionDevices(),
-        model_package_context.DevicesSelected()));
-  }
+  const VariantSelectionEpInfo* selected_ep_info = model_package_context.SelectedEpInfo();
+  ORT_API_RETURN_IF(selected_ep_info == nullptr, ORT_FAIL, "No variant is selected for the component.");
+  const auto& selected_ep = selected_ep_info->ep_name;
+  const auto& registered_eps = sess->GetRegisteredProviderTypes();
+  ORT_API_RETURN_IF(selected_ep != kCpuExecutionProvider &&
+                        std::find(registered_eps.begin(), registered_eps.end(), selected_ep) == registered_eps.end(),
+                    ORT_EP_FAIL, "The selected model package execution provider was not registered: ", selected_ep);
 
   return nullptr;
 }

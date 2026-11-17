@@ -11,12 +11,11 @@ adds three things on top**:
 
 1. The `executor_info["ort"]` payload schema (this is ORT's slot in the
    variant body).
-2. The variant selection algorithm, which queries each execution provider
-   factory and picks the highest-scoring variant.
-3. The experimental `OrtModelPackageApi_*` C functions that wrap the library
-   and expose session creation. They are registered in
-   `include/onnxruntime/core/session/onnxruntime_experimental_c_api.inc` and
-   resolved by name through `OrtApi::GetExperimentalFunction`.
+2. The variant selection algorithm considers execution providers in priority
+   order. For the first EP with matching variants, it selects the variant
+   with the highest compatibility score.
+3. The stable `OrtModelPackageApi` C API table that wraps the library and
+   exposes session creation through `OrtApi::GetModelPackageApi`.
 
 ORT links the `model_package` library as a static archive; the library
 itself never links against ORT.
@@ -27,13 +26,13 @@ itself never links against ORT.
 
 | File                                  | Responsibility |
 | ------------------------------------- | -------------- |
-| `model_package_context.h/.cc`         | Translates the `model_package` library's C info tree into ORT-internal C++ structs (`ModelPackageInfo`, `ComponentInfo`, `VariantInfo`, `VariantModelInfo`). Parses the `executor_info["ort"]` payload. Owns `ModelPackageContext` (package-level) and `ModelPackageComponentContext` (per-component, with selected variant and provider list). |
-| `model_package_options.h/.cc`         | `ModelPackageOptions` snapshots EP intent (factories, devices, EP-name list) from an `OrtSessionOptions` at the moment `OrtModelPackageApi_CreateModelPackageOptionsFromSessionOptions_SinceV28` is called. Drives variant selection and provider construction. |
+| `model_package_context.h/.cc`         | Translates the `model_package` library's C info tree into ORT-internal C++ structs (`ModelPackageInfo`, `ComponentInfo`, `VariantInfo`, `VariantModelInfo`). Parses the `executor_info["ort"]` payload. Owns `ModelPackageContext` (package-level) and `ModelPackageComponentContext` (per-component, with the selected variant, the captured EPs, and their provider factories saved for session creation). |
+| `model_package_options.h/.cc`         | `ModelPackageOptions` snapshots EP intent (factories, devices, EP-name list) from an `OrtSessionOptions` when `OrtModelPackageApi::CreateModelPackageOptionsFromSessionOptions` is called. Drives variant selection and provider construction. |
 | `model_package_variant_selector.h/.cc`| `VariantSelector::SelectVariant` picks the best variant from a component given the EP list. Uses `OrtEpFactory::ValidateCompiledModelCompatibilityInfo`. |
 
 The C entry points themselves live in
 `onnxruntime/core/session/model_package_api.cc` under
-`namespace OrtExperimentalApis`.
+`namespace OrtModelPackageAPI`.
 
 ---
 
@@ -46,7 +45,7 @@ optional, but in practice `model_file` is required to load a session.
 {
   "model_file":       "model.onnx",
   "session_options":  {
-    "session.intra_op_thread_count": "4",
+    "session.intra_op_num_threads": "4",
     "session.model_external_initializers_file_folder_path": "weights"
   },
   "provider_options": { "device_id": "0" }
@@ -56,8 +55,8 @@ optional, but in practice `model_file` is required to load a session.
 | Field              | Type   | Required | Notes |
 | ------------------ | ------ | -------- | ----- |
 | `model_file`       | string | yes (for session) | Path to the model file inside the variant. Resolved via `ModelPackage_ResolveStringRef`, anchored at the variant directory. Accepts relative paths, absolute paths or `..` segments (installed layout only), and `sha256:<hex>[/sub/path]` for shared-asset content. |
-| `session_options`  | object | no       | Map of `string -> string`. Merged on top of a fresh `OrtSessionOptions` when the caller passes `session_options == NULL` to `CreateSession`. Values of path-valued keys (see `IsModelPackagePathSessionOption`, e.g. `session.model_external_initializers_file_folder_path`, `ep.context_file_path`) are resolved with the same rules as `model_file` at parse time. Those path-valued keys are also applied on the advanced path if the caller did not set them (see below). |
-| `provider_options` | object | no       | Map of `string -> string`. Merged into the variant's EP provider options on the default path. Ignored when the caller supplies their own `OrtSessionOptions`. |
+| `session_options`  | object | no       | Map of `string -> string`. Merged on top of a fresh `OrtSessionOptions` when the caller passes `session_options == NULL` to `CreateSession`. Values of path-valued keys (see `IsModelPackagePathSessionOption`, e.g. `session.model_external_initializers_file_folder_path`, `ep.context_file_path`) are resolved with the same rules as `model_file` at parse time. Those path-valued keys are also applied on the advanced path if the caller did not set them (see below). Output file options (`session.debug_layout_transformation`, `session.collect_node_memory_stats_to_file`, `session.enable_profiling`, and `session.optimized_model_filepath`) are forbidden in a package and cause package parsing to fail; only caller-supplied `OrtSessionOptions` may set those keys. |
+| `provider_options` | object | no       | Map of `string -> string`. Overrides the selected device's default EP options on the default path. Requires the selected EP to expose `OrtEpDevice` metadata; otherwise a non-empty map is rejected. Ignored when the caller supplies their own `OrtSessionOptions`. |
 
 #### Inline vs external
 
@@ -80,35 +79,74 @@ variant can carry per-consumer payloads side by side.
 
 ## Variant selection
 
-`ModelPackageOptions(env, session_options)` captures the **EP intent**: the
-ordered list of execution providers registered on the session options, plus
-their associated `OrtEpDevice` / `OrtHardwareDevice` / metadata.
+`ModelPackageOptions(env, session_options)` records the EPs in priority
+order and saves their device information and metadata. When a policy
+selects the EPs, ORT records the selected devices and the factory used
+to create each EP. For explicitly added EPs, device information comes
+from the provider's `GetEpDevices()`, which currently returns devices
+only for plugin EPs. ORT saves the provider factories from the session
+options so it can create legacy EPs again. Some saved factories depend on
+the original session options. For example, the XNNPACK factory reads those
+options when creating an EP. Do not release those session options until all
+sessions using the saved factories have been created.
 
-`VariantSelector::SelectVariant(component, ep_infos, &selected)` then walks
-the component's variants and picks the best match:
+When EPs are added explicitly, only EPs created by the provider factories
+in the session options are recorded. Adding the built-in CPU EP as "CPU"
+through SessionOptionsAppendExecutionProvider does not add a factory.
+To make the built-in CPU EP a candidate after other EPs, append it using
+SessionOptionsAppendExecutionProvider_V2 or
+OrtSessionOptionsAppendExecutionProvider_CPU. If the session options
+contain no provider factories and no selection policy is enabled, only the
+built-in CPU EP is recorded. Built-in selection policies include the
+built-in CPU EP as the last candidate unless CPU EP fallback is disabled.
 
-1. Use only the **first** EP from the captured list. (A policy may rank
-   several EPs; callers that need a specific EP should put it first.
-   Ranking across the full EP list is on the TODO list.)
+`VariantSelector::SelectVariant` selects the best matching variant for
+the component and identifies its target EP:
+
+1. Consider the captured EPs in priority order, as determined by the
+   selection policy or the order in which they were added to the session
+   options. Select the first EP with a matching variant.
 2. For each variant, require `variant.ep == ep_info.ep_name`.
 3. If `variant.device` is set (`"cpu"` / `"gpu"` / `"npu"`), require it to
    match at least one of the EP's `OrtHardwareDevice` entries.
-4. If both pass, call `OrtEpFactory::ValidateCompiledModelCompatibilityInfo`
-   with `variant.compatibility_string`. The EP returns an
-   `OrtCompiledModelCompatibility` enum which maps to a score:
+   The built-in CPU EP matches `"device": "cpu"` even without captured
+   devices, but does not match other device types.
+   If captured devices exist but none has the required type, the variant
+   does not match.
+   If no devices were captured for an EP other than the built-in CPU EP,
+   ORT cannot check the requirement. If no other variant matches that EP,
+   selection returns an error instead of considering EPs with lower priority.
+   A default memory device type is not enough to determine the target
+   hardware.
+4. If both pass, call OrtEpFactory::ValidateCompiledModelCompatibilityInfo
+   with variant.compatibility_string and the EP's captured hardware devices
+   matching the variant's declared device type, or all captured hardware
+   devices if no type is declared. The EP returns an
+   OrtCompiledModelCompatibility enum which maps to a score:
 
-   | Enum                                         | Score |
-   | -------------------------------------------- | ----- |
-   | `EP_SUPPORTED_OPTIMAL`                       | 100   |
-   | `EP_SUPPORTED_PREFER_RECOMPILATION`          |  50   |
-   | `EP_NOT_APPLICABLE` (or EP too old / no ABI) |   0   |
-   | `EP_UNSUPPORTED`                             | rejected |
+   | Enum                                                                    | Score |
+   | ----------------------------------------------------------------------- | ----- |
+   | `EP_SUPPORTED_OPTIMAL`                                                  | 100   |
+   | `EP_SUPPORTED_PREFER_RECOMPILATION`                                     |  50   |
+   | `EP_NOT_APPLICABLE` (or EP too old / no ABI / no `OrtEpFactory` captured) |   0   |
+   | `EP_UNSUPPORTED`                                                        | rejected |
 
-5. Pick the highest-scoring matching variant. Manifest declaration order
-   breaks ties.
+   If no OrtEpFactory was captured for the EP (for example, for an EP added
+   by name), ORT does not check the compatibility string. The compatibility
+   result is EP_NOT_APPLICABLE.
+
+   `EP_UNSUPPORTED` means the check succeeded but the variant is not
+   compatible. If the callback itself returns an error, compatibility
+   remains unknown. If no other variant matches that EP, selection returns
+   an error instead of considering EPs with lower priority.
+
+5. Select the matching variant with the highest compatibility score for
+   that EP. If several variants have the same score, select the first one
+   in the manifest.
 
 If no variant matches, `SelectComponent` fails with "No suitable model
-variant found for the configured execution providers."
+variant found for the configured execution providers." If selection stops at
+an EP as described in steps 3 and 4, the error also names that EP.
 
 ORT does **not** parse `compatibility_string`. The EP owns the format and
 may encode multiple sub-targets (SoC ids, ISA flags, etc.) into the single
@@ -118,19 +156,21 @@ string internally; ORT only round-trips it through the EP callback.
 
 ## Session creation contract
 
-`OrtModelPackageApi_CreateSession_SinceV28(env, component_ctx, session_options, &session)`.
+`OrtModelPackageApi::CreateSession(env, component_ctx, session_options, &session)`.
 
 The `component_ctx` already knows which variant won selection and which
-provider list it should use. Two paths:
+EP was selected. Two paths:
 
 - **`session_options == NULL` (default).** ORT starts from a fresh
   `OrtSessionOptions` and merges the variant's `session_options` /
-  `provider_options` from `executor_info["ort"]` on top. EPs declared in the
-  manifest are constructed and registered. This is what nearly all callers
-  want.
+  `provider_options` from `executor_info["ort"]` on top. The selected EP's
+  default device options are included even when the package does not provide
+  overrides. Its custom-op domains are registered before the model is loaded.
+  A retained legacy factory keeps its own EP-specific configuration.
 
-- **`session_options != NULL` (advanced).** ORT uses the caller-supplied
-  `OrtSessionOptions` as-is. The manifest's `session_options` and
+- **`session_options != NULL` (advanced).** ORT copies the caller-supplied
+  `OrtSessionOptions`, preserving explicit provider factories and their order,
+  including fallback providers. The manifest's `session_options` and
   `provider_options` are **not** merged, with one exception: path-valued
   session options (see `IsModelPackagePathSessionOption`) are carried over
   from the variant for keys the caller did not set, so a model that needs its
@@ -139,7 +179,62 @@ provider list it should use. Two paths:
   streams, shared QNN EP contexts, custom allocators, ...). The
   `OrtSessionOptions` passed earlier to
   `CreateModelPackageOptionsFromSessionOptions` only drives variant
-  selection / EP discovery; it is never silently re-applied here.
+  selection / EP discovery; its non-EP session configuration is not
+  implicitly inherited.
+
+When the effective session options contain no EP factories, ORT adds
+only the EP targeted by the selected variant, as in
+`SessionOptionsAppendExecutionProvider_V2`. ORT uses the devices captured
+for that EP. If the variant specifies a device type, ORT uses only
+devices of that type. Otherwise, it uses all captured devices for that EP.
+
+Device defaults are used only for EP options that have not already been
+set, including options from the variant's `session_options`. Custom
+operator domains provided by the EP's OrtEpDevice instances are
+registered before loading the model. On the default path, the variant's
+provider_options are passed to the selected EP as in
+SessionOptionsAppendExecutionProvider_V2. For example, the CoreML EP rejects
+an MLComputeUnits value that enables an unselected accelerator.
+
+If no `OrtEpDevice` instances were captured for the EP, ORT uses the
+provider factory saved from the session options used to create the
+model package options. The built-in CPU EP does not require a saved
+factory. Custom operator domain registrations from the original session
+options are not copied on the default path. To use TensorRT plugin
+domains, for example, pass session options containing those domains. On
+the default path, non-empty package provider_options cause an error if no
+OrtEpDevice instances were captured for the selected EP. Devices are
+captured for the built-in CPU EP only when it is selected by a policy.
+
+When the caller supplies no EP factories, ORT adds only the EP selected for
+the variant, apart from the usual built-in CPU EP fallback. CreateSession
+does not run the EP selection policy in the session options.
+
+If the caller supplies EP factories, ORT registers the EPs they create in
+factory order. Factories that return no EP are skipped. The caller must
+ensure that the EP configuration is compatible with the selected variant.
+EPs registered earlier are considered first when assigning model nodes.
+If the caller passes the same session options used for variant selection,
+ORT can assign nodes from the selected variant's model to an EP even if
+no variant matches that EP. To let ORT configure the selected EP, pass NULL
+or session options without EP factories. If the selected EP is not the
+built-in CPU EP, at least one factory in the list must create it.
+The CPU registration APIs behave differently:
+
+- Adding the built-in ORT CPU EP as "CPU" through
+  `SessionOptionsAppendExecutionProvider` does not add a provider factory
+  to the options.
+- `OrtSessionOptionsAppendExecutionProvider_CPU` adds a CPU EP factory.
+
+ORT automatically adds the built-in CPU EP if it has not already
+been registered. If the selected EP is not the built-in CPU EP and
+cannot be created or registered, session creation fails. Nodes that
+other EPs do not handle may still run on the built-in CPU EP unless
+CPU EP fallback is disabled.
+
+Each session creates its own EP instances through the normal ORT factory
+registration path. A component context can create multiple sessions sequentially;
+creating a session does not consume its captured factory.
 
 A variant points ORT at external-initializer weights by setting
 `session.model_external_initializers_file_folder_path` in its
@@ -152,20 +247,13 @@ by) the package.
 
 ## C API surface
 
-The model package API is exposed via ONNX Runtime's
-[experimental C API](../../../../docs/design/Experimental_C_API.md). Each
-function is registered as a separate entry in
-`include/onnxruntime/core/session/onnxruntime_experimental_c_api.inc` with
-prefix `OrtModelPackageApi_` and version suffix `_SinceV28`. Consumers look
-the functions up by name through `OrtApi::GetExperimentalFunction`, either
-directly or via the typed C++ accessors in `Ort::Experimental::*` generated
-from `onnxruntime_experimental_c_api.h`.
+The model package API is a stable companion table returned by
+`OrtApi::GetModelPackageApi`. Its opaque handles
+(`OrtModelPackageOptions`, `OrtModelPackageContext`, and
+`OrtModelPackageComponentContext`) and function table are declared in
+`onnxruntime_c_api.h`. `onnxruntime_cxx_api.h` provides RAII wrappers.
 
-The opaque handle types (`OrtModelPackageOptions`, `OrtModelPackageContext`,
-`OrtModelPackageComponentContext`) are forward-declared at the top of
-`onnxruntime_experimental_c_api.h`.
-
-Registered entries:
+API entries:
 
 | Function                                              | Notes |
 | ----------------------------------------------------- | ----- |
@@ -173,71 +261,71 @@ Registered entries:
 | `ReleaseModelPackageOptions`                          |       |
 | `CreateModelPackageContext`                           | Parses the manifest. |
 | `ReleaseModelPackageContext`                          |       |
-| `ModelPackage_GetSchemaVersion`                       |       |
+| `ModelPackage_GetSchemaVersion`                       | Returns the schema major version. |
 | `ModelPackage_GetComponentCount`                      |       |
 | `ModelPackage_GetComponentNames`                      |       |
 | `ModelPackage_GetVariantCount`                        |       |
 | `ModelPackage_GetVariantNames`                        |       |
 | `ModelPackage_GetVariantEpName`                       |       |
+| `ModelPackage_ResolveStringRef`                       | Resolves UTF-8 path references. |
 | `SelectComponent`                                     | Resolves the best-matching variant. |
 | `ReleaseModelPackageComponentContext`                 |       |
 | `ModelPackageComponent_GetSelectedVariantName`        |       |
 | `ModelPackageComponent_GetSelectedVariantFolderPath`  |       |
 | `CreateSession`                                       |       |
 
-> Experimental functions are not part of the stable ABI. Names, signatures
-> and behaviour may change between releases until the surface is promoted
-> to the stable `OrtApi`. Callers should null-check every lookup.
-
 Typical flow:
 
 ```cpp
 #include "onnxruntime_c_api.h"
-#include "onnxruntime_experimental_c_api.h"
 
 const OrtApi* ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-
-auto fn_create_opts =
-    Ort::Experimental::Get_OrtModelPackageApi_CreateModelPackageOptionsFromSessionOptions_SinceV28_Fn(ort);
-auto fn_release_opts =
-    Ort::Experimental::Get_OrtModelPackageApi_ReleaseModelPackageOptions_SinceV28_Fn(ort);
-auto fn_create_ctx =
-    Ort::Experimental::Get_OrtModelPackageApi_CreateModelPackageContext_SinceV28_Fn(ort);
-auto fn_release_ctx =
-    Ort::Experimental::Get_OrtModelPackageApi_ReleaseModelPackageContext_SinceV28_Fn(ort);
-auto fn_select =
-    Ort::Experimental::Get_OrtModelPackageApi_SelectComponent_SinceV28_Fn(ort);
-auto fn_release_comp =
-    Ort::Experimental::Get_OrtModelPackageApi_ReleaseModelPackageComponentContext_SinceV28_Fn(ort);
-auto fn_create_session =
-    Ort::Experimental::Get_OrtModelPackageApi_CreateSession_SinceV28_Fn(ort);
+const OrtModelPackageApi* package_api = ort->GetModelPackageApi();
 
 OrtSessionOptions* so = nullptr;
 ort->CreateSessionOptions(&so);
-ort->SessionOptionsAppendExecutionProvider(so, "CUDAExecutionProvider", nullptr, nullptr, 0);
+ort->SessionOptionsSetEpSelectionPolicy(so, OrtExecutionProviderDevicePolicy_PREFER_GPU);
 
 OrtModelPackageOptions* mp_opts = nullptr;
-fn_create_opts(env, so, &mp_opts);
+package_api->CreateModelPackageOptionsFromSessionOptions(env, so, &mp_opts);
 
 OrtModelPackageContext* ctx = nullptr;
-fn_create_ctx(ORT_TSTR("/path/to/pkg"), &ctx);
+package_api->CreateModelPackageContext(ORT_TSTR("/path/to/pkg"), &ctx);
 
 OrtModelPackageComponentContext* comp_ctx = nullptr;
-fn_select(ctx, "decoder", mp_opts, &comp_ctx);
+package_api->SelectComponent(ctx, "decoder", mp_opts, &comp_ctx);
 
 OrtSession* session = nullptr;
-fn_create_session(env, comp_ctx, nullptr, &session);
+package_api->CreateSession(env, comp_ctx, nullptr, &session);
 
 ort->ReleaseSession(session);
-fn_release_comp(comp_ctx);
-fn_release_ctx(ctx);
-fn_release_opts(mp_opts);
+package_api->ReleaseModelPackageComponentContext(comp_ctx);
+package_api->ReleaseModelPackageContext(ctx);
+package_api->ReleaseModelPackageOptions(mp_opts);
 ort->ReleaseSessionOptions(so);
 ```
 
-All `const char*` / `const ORTCHAR_T*` / array pointers returned by the API
-are owned by the context that produced them and remain valid until the
-context is released.
+Borrowed names, arrays, and selected folder paths remain valid until their context
+is released, including across repeated queries. `ModelPackage_ResolveStringRef`
+is the exception: its result is valid only until the next resolver call on the
+same package context. Do not free borrowed pointers. Failed calls leave output
+parameters unchanged.
+
+Strings and path references represented as `char*` are UTF-8. Native filesystem
+paths explicitly represented as `ORTCHAR_T*` use UTF-16 on Windows and UTF-8 on
+other platforms. The integration performs explicit conversions at the standalone
+library boundary.
+
+The environment and registered EP libraries must outlive the model package
+options, component contexts, and sessions that use them. The options and
+the component contexts created from them keep pointers to OrtEpDevice and
+OrtEpFactory instances. When a selection policy is used, the options and
+component contexts keep pointers to every OrtEpDevice instance available
+in the environment. EP libraries registered when the options are created
+must stay registered until the options and all those component contexts
+are released. A selected component does not depend on the lifetime of its
+original package or options handles.
+Calls sharing a package or component context require external synchronization.
 
 ---
 
@@ -246,8 +334,5 @@ context is released.
 - [`model_package/README.md`](../../../../model_package/README.md): package
   format, manifest/component schema, shared assets, path resolution, the
   authoring C API, and the `executor_info` extension point.
-- [`docs/design/Experimental_C_API.md`](../../../../docs/design/Experimental_C_API.md):
-  design and lifecycle rules for the experimental C API mechanism that
-  hosts these entries.
-- `include/onnxruntime/core/session/onnxruntime_experimental_c_api.inc`:
-  the canonical list of `OrtModelPackageApi_*` entries.
+- `include/onnxruntime/core/session/onnxruntime_c_api.h`: the stable
+  `OrtModelPackageApi` declaration.

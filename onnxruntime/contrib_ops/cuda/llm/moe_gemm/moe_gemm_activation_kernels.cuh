@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <math_constants.h>
+
 #include "core/common/common.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/common.h"
@@ -32,6 +34,14 @@ namespace onnxruntime::llm::kernels::cutlass_kernels {
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
 struct QuantParams;
+
+template <class T>
+struct ReluSquared {
+  CUTLASS_HOST_DEVICE T operator()(const T& value) const {
+    const T positive = cutlass::epilogue::thread::ReLu<T>{}(value);
+    return positive * positive;
+  }
+};
 
 template <class ActivationOutputType, class GemmOutputType, template <class> class ActFn>
 __global__ void doGatedActivationKernel(ActivationOutputType* output, const GemmOutputType* gemm_result,
@@ -88,7 +98,7 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, const Gemm
     if (use_custom_swiglu) {
       for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
         float g = gate_part[i];
-        if (isfinite(activation_params.limit)) {
+        if (isfinite(activation_params.limit) && !activation_params.swiglu_limit_after_activation) {
           g = fminf(g, activation_params.limit);
         }
         float sigmoid = 1.0f / (1.0f + expf(-activation_params.alpha * g));
@@ -97,10 +107,23 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, const Gemm
           l = fminf(fmaxf(l, -activation_params.limit), activation_params.limit);
         }
         l += activation_params.beta;
-        gate_act[i] = g * sigmoid * l;
+        // SiLU's limit is zero where exp(-alpha * g) overflows.
+        const bool silu_limit_is_zero = (activation_params.alpha > 0.0f && g == -CUDART_INF_F) ||
+                                        (activation_params.alpha < 0.0f && g == CUDART_INF_F);
+        float activated = silu_limit_is_zero ? 0.0f : g * sigmoid;
+        if (activation_params.swiglu_limit_after_activation) {
+          activated = fminf(activated, activation_params.limit);
+        }
+        gate_act[i] = activated * l;
       }
     } else {
-      gate_act = fn(gate_part) * linear_part;
+      gate_act = fn(gate_part);
+      if constexpr (std::is_same_v<ActFn<float>, cutlass::epilogue::thread::SiLu<float>>) {
+        for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
+          if (gate_part[i] == -CUDART_INF_F) gate_act[i] = 0.0f;
+        }
+      }
+      gate_act = gate_act * linear_part;
     }
 
     output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(gate_act);
@@ -123,14 +146,15 @@ void doGatedActivation(ActivationOutputType* output, const GemmOutputType* gemm_
       case ActivationType::SwigluBias:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SiLu>;
       case ActivationType::Geglu:
-        return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GELU>;
+        return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GELU_taylor>;
       case ActivationType::Silu:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SiLu>;
       case ActivationType::Gelu:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GELU>;
       case ActivationType::Relu:
-      case ActivationType::Relu2:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, ReLu>;
+      case ActivationType::Relu2:
+        return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, ReluSquared>;
       case ActivationType::Identity:
       default:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, Identity>;
@@ -212,11 +236,15 @@ __global__ void doActivationKernel(T* output, const GemmOutputType* gemm_result,
     auto output_vec = reinterpret_cast<OutputElem*>(safe_inc_ptr(output, output_offset));
     auto bias_ptr_vec = reinterpret_cast<const BiasElem*>(bias_ptr + bias_offset);
     const int64_t start_offset = tid;
-    const int64_t stride = ACTIVATION_THREADS_PER_BLOCK;
+    const int64_t stride = blockDim.x;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
     const int64_t num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
     const int64_t gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
+    // Chunked GEGLU is [gate | up]; preserve the legacy SwiGLU chunk order.
+    const int64_t gate_offset =
+        gated && activation_params.activation_type == ActivationType::Geglu ? 0 : gated_off_vec;
+    const int64_t linear_offset = gated_off_vec - gate_offset;
 
     ActFn<ComputeElem> fn{};
     constexpr bool IsSiLu = std::is_same_v<ActFn<float>, cutlass::epilogue::thread::SiLu<float>>;
@@ -235,11 +263,9 @@ __global__ void doActivationKernel(T* output, const GemmOutputType* gemm_result,
           linear_part[i] = static_cast<float>(scalar_gemm[2 * global_elem + 1]);
         }
       } else {
-        // If not gated, gate_part reads from elem_index (gated_off_vec is 0).
-        // If gated, gate_part reads from elem_index + inter_size_vec (chunk 1).
-        gate_part = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
+        gate_part = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gate_offset]);
         if (gated) {
-          linear_part = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
+          linear_part = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + linear_offset]);
         }
       }
 
@@ -252,9 +278,9 @@ __global__ void doActivationKernel(T* output, const GemmOutputType* gemm_result,
             linear_part[i] += static_cast<float>(scalar_bias[2 * global_elem + 1]);
           }
         } else {
-          gate_part = gate_part + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + gated_off_vec]);
+          gate_part = gate_part + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + gate_offset]);
           if (gated) {
-            linear_part = linear_part + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index]);
+            linear_part = linear_part + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + linear_offset]);
           }
         }
       }
@@ -263,7 +289,7 @@ __global__ void doActivationKernel(T* output, const GemmOutputType* gemm_result,
       if (use_custom_swiglu) {
         for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
           float g = gate_part[i];
-          if (isfinite(activation_params.limit)) {
+          if (isfinite(activation_params.limit) && !activation_params.swiglu_limit_after_activation) {
             g = fminf(g, activation_params.limit);
           }
           float sigmoid = 1.0f / (1.0f + expf(-activation_params.alpha * g));
@@ -272,10 +298,22 @@ __global__ void doActivationKernel(T* output, const GemmOutputType* gemm_result,
             l = fminf(fmaxf(l, -activation_params.limit), activation_params.limit);
           }
           l += activation_params.beta;
-          gate_act[i] = g * sigmoid * l;
+          // SiLU's limit is zero where exp(-alpha * g) overflows.
+          const bool silu_limit_is_zero = (activation_params.alpha > 0.0f && g == -CUDART_INF_F) ||
+                                          (activation_params.alpha < 0.0f && g == CUDART_INF_F);
+          float activated = silu_limit_is_zero ? 0.0f : g * sigmoid;
+          if (activation_params.swiglu_limit_after_activation) {
+            activated = fminf(activated, activation_params.limit);
+          }
+          gate_act[i] = activated * l;
         }
       } else {
         gate_act = fn(gate_part);
+        if constexpr (IsSiLu) {
+          for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
+            if (gate_part[i] == -CUDART_INF_F) gate_act[i] = 0.0f;
+          }
+        }
         if (gated) {
           gate_act = gate_act * linear_part;
         }
@@ -318,7 +356,7 @@ __global__ void doActivationKernel(T* output, const GemmOutputType* gemm_result,
   // atom
   if constexpr (IsNVFP4 || IsMXFP8) {
     const int64_t start_offset = threadIdx.x;
-    const int64_t stride = ACTIVATION_THREADS_PER_BLOCK;
+    const int64_t stride = blockDim.x;
     // Use VecSize per thread since we are just writing out zeros so every thread can process a whole vector
     const int64_t padded_num_elems_in_col = padded_inter_size / VecSize;
     assert(padded_inter_size % VecSize == 0);
@@ -369,9 +407,21 @@ void doActivation(T* output, const GemmOutputType* gemm_result, const float* fp8
 #endif
 
   static const int64_t smCount = onnxruntime::llm::common::getMultiProcessorCount();
-  // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  const int64_t blocks = std::min(smCount * 8, std::max(expanded_num_tokens, num_padding_tokens));
-  const int64_t threads = ACTIVATION_THREADS_PER_BLOCK;
+  int64_t threads = ACTIVATION_THREADS_PER_BLOCK;
+  int64_t blocks_per_sm = 8;
+  if constexpr (sizeof(T) >= 2 && sizeof(GemmOutputType) >= 2) {
+    constexpr int64_t kActElemPerThread =
+        128 / std::min(cutlass::sizeof_bits<T>::value, cutlass::sizeof_bits<GemmOutputType>::value);
+    if (inter_size > 0 && (inter_size % kActElemPerThread) == 0) {
+      const int64_t vec_cols = inter_size / kActElemPerThread;
+      const int64_t aligned_threads = ((vec_cols + 31) / 32) * 32;
+      if (aligned_threads >= 64 && aligned_threads <= 512) {
+        threads = aligned_threads;
+        blocks_per_sm = std::clamp<int64_t>(2048 / threads, 4, 24);
+      }
+    }
+  }
+  const int64_t blocks = std::min(smCount * blocks_per_sm, std::max(expanded_num_tokens, num_padding_tokens));
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type) {
@@ -381,11 +431,13 @@ void doActivation(T* output, const GemmOutputType* gemm_result, const float* fp8
         case ActivationType::Identity:
           return &doActivationKernel<T, GemmOutputType, ScaleBiasType, Identity, decltype(block_scaling_type)::value>;
         case ActivationType::Gelu:
-        case ActivationType::Geglu:
           return &doActivationKernel<T, GemmOutputType, ScaleBiasType, GELU, decltype(block_scaling_type)::value>;
+        case ActivationType::Geglu:
+          return &doActivationKernel<T, GemmOutputType, ScaleBiasType, GELU_taylor, decltype(block_scaling_type)::value>;
         case ActivationType::Relu:
-        case ActivationType::Relu2:
           return &doActivationKernel<T, GemmOutputType, ScaleBiasType, ReLu, decltype(block_scaling_type)::value>;
+        case ActivationType::Relu2:
+          return &doActivationKernel<T, GemmOutputType, ScaleBiasType, ReluSquared, decltype(block_scaling_type)::value>;
         case ActivationType::Silu:
         case ActivationType::Swiglu:
         case ActivationType::SwigluBias:

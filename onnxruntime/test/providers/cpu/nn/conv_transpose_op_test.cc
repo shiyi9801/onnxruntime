@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
+#include <random>
+
 #include "core/providers/xnnpack/xnnpack_init.h"
 #include "gtest/gtest.h"
 #include "test/providers/provider_test_utils.h"
@@ -9,8 +12,10 @@
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/graph/model.h"
 #include "core/graph/node_attr_utils.h"
+#include "core/providers/cpu/nn/conv_transpose_internal.h"
 #include "core/session/inference_session.h"
 #include "test/unittest_util/framework_test_utils.h"
+#include "test/unittest_util/test_dynamic_plugin_ep.h"
 #include "test/util/include/test_environment.h"
 
 namespace onnxruntime {
@@ -134,6 +139,26 @@ TEST(ConvTransposeTest, ConvTranspose_1D) {
                                       9.4f, 22.5f, 39.6f, 30.f, 17.f};
 
   TestConvTransposeOp(attrs, {X, W}, {X_shape, W_shape}, expected_vals, Y_shape);
+}
+
+TEST(ConvTransposeTest, ConvTranspose_2x2_Stride2_GroupBiasBatch) {
+  const ConvTransposeOpAttributes attrs{
+      {2, 2}, {}, {}, {0, 0, 0, 0}, {2, 2}, {1, 1}, 2, "NOTSET"};
+  const std::vector<float> input = {1, 2, 3, -1, -2, -3, 4, 5, 6, -4, -5, -6};
+  const std::vector<float> weights = {1, 2, 3, 4, -1, -2, -3, -4,
+                                      5, 6, 7, 8, -5, -6, -7, -8};
+  const std::vector<float> bias = {1, 2, 3, 4};
+  const std::vector<float> expected = {
+      2, 3, 3, 5, 4, 7, 4, 5, 7, 9, 10, 13,
+      1, 0, 0, -2, -1, -4, -1, -2, -4, -6, -7, -10,
+      -2, -3, -7, -9, -12, -15, -4, -5, -11, -13, -18, -21,
+      9, 10, 14, 16, 19, 22, 11, 12, 18, 20, 25, 28,
+      5, 9, 6, 11, 7, 13, 13, 17, 16, 21, 19, 25,
+      -2, -6, -3, -8, -4, -10, -10, -14, -13, -18, -16, -22,
+      -17, -21, -22, -27, -27, -33, -25, -29, -32, -37, -39, -45,
+      24, 28, 29, 34, 34, 40, 32, 36, 39, 44, 46, 52};
+  TestConvTransposeOp(attrs, {input, weights, bias},
+                      {{2, 2, 1, 3}, {2, 2, 2, 2}, {4}}, expected, {2, 4, 2, 6});
 }
 
 TYPED_TEST(ConvTransposeTest, ConvTranspose_2D_outputpadding_strides2) {
@@ -552,6 +577,25 @@ TEST(ConvTransposeTest, ConvTranspose_RankPlus2_OutputShape_DynamicRankInput_Run
   for (size_t i = 0; i < expected_vals.size(); ++i) {
     EXPECT_FLOAT_EQ(span[i], expected_vals[i]) << "mismatch at index " << i;
   }
+}
+
+TEST(ConvTransposeTest, MissingBiasCUDA) {
+  auto cuda_ep = DefaultCudaExecutionProvider();
+  if (!cuda_ep) {
+    GTEST_SKIP() << "CUDA execution provider is not available.";
+  }
+
+  OpTester test("ConvTranspose", 11);
+  test.AddInput<float>("X", {1, 1, 2, 2}, {1.f, 2.f, 3.f, 4.f});
+  test.AddInput<float>("W", {1, 1, 1, 1}, {2.f});
+  test.AddOptionalInputEdge<float>();
+  test.AddOutput<float>("Y", {1, 1, 2, 2}, {2.f, 4.f, 6.f, 8.f});
+
+  SessionOptions options;
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1"));
+  std::vector<std::unique_ptr<IExecutionProvider>> providers;
+  providers.push_back(std::move(cuda_ep));
+  test.Run(options, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &providers);
 }
 
 TEST(ConvTransposeTest, ConvTranspose_2D_OutputShape_2_OpSet22_CUDA) {
@@ -1121,7 +1165,7 @@ TEST(ConvTransposeTest, DimWithZero) {
   TestConvTransposeOp(attrs, {X, W}, {X_shape, W_shape}, expected_vals, Y_shape,
                       OpTester::ExpectResult::kExpectSuccess, "",
                       {kCudaNHWCExecutionProvider, kTensorrtExecutionProvider,
-                       kAclExecutionProvider, kQnnExecutionProvider, kWebGpuExecutionProvider});
+                       kQnnExecutionProvider, kWebGpuExecutionProvider});
 }
 
 TEST(ConvTransposeTest, ConvTranspose_3D) {
@@ -1256,7 +1300,7 @@ TEST(ConvTransposeTest, ConvTranspose_3D) {
   TestConvTransposeOp(attrs, {X, W, B}, {X_shape, W_shape, B_shape}, expected_vals, Y_shape,
                       OpTester::ExpectResult::kExpectSuccess, "",
                       {kTensorrtExecutionProvider, kCudaExecutionProvider,
-                       kCudaNHWCExecutionProvider, kQnnExecutionProvider, kWebGpuExecutionProvider});
+                       kCudaNHWCExecutionProvider, kQnnExecutionProvider});
 }
 
 TEST(ConvTransposeTest, ConvTranspose_1D_AsymmetricPads) {
@@ -1793,10 +1837,10 @@ TEST(ConvTransposeTest, ConvTranspose_3D_InconsistentOutputShape) {
   test.AddInput<float>("W", {1, 1, 2, 2, 2}, std::vector<float>(8, 1.0f));
   test.AddOutput<float>("Y", {0}, {});
 
-  // CUDA/WebGPU don't support 3D ConvTranspose in most builds.
+  // CUDA doesn't support 3D ConvTranspose in most builds.
   test.Run(OpTester::ExpectResult::kExpectFailure, "inconsistent with input spatial dimensions",
            {kTensorrtExecutionProvider, kQnnExecutionProvider, kDmlExecutionProvider,
-            kCudaExecutionProvider, kCudaNHWCExecutionProvider, kWebGpuExecutionProvider});
+            kCudaExecutionProvider, kCudaNHWCExecutionProvider});
 }
 
 // Test that a valid 3D explicit output_shape with non-trivial padding works correctly.
@@ -1827,7 +1871,7 @@ TEST(ConvTransposeTest, ConvTranspose_3D_ValidOutputShape) {
                       OpTester::ExpectResult::kExpectSuccess, "",
                       {kTensorrtExecutionProvider, kCudaExecutionProvider,
                        kCudaNHWCExecutionProvider, kQnnExecutionProvider,
-                       kDmlExecutionProvider, kWebGpuExecutionProvider});
+                       kDmlExecutionProvider});
 }
 
 // Test group > 1 with explicit output_shape.
@@ -2046,7 +2090,44 @@ TEST(ConvTransposeTest, ConvTranspose_2D_ValidOutputPadding_ConsistencyCheck) {
                        kCudaNHWCExecutionProvider});
 }
 
+TEST(ConvTransposeTest, ZeroInputChannelsWithLargeSpatialDimensions) {
+  OpTester test("ConvTranspose", 11);
+  test.AddShapeToTensorData(false);
+  constexpr int64_t kLargeDimension = static_cast<int64_t>(1) << 32;
+  test.AddAttribute("kernel_shape", std::vector<int64_t>{kLargeDimension});
+  test.AddAttribute("pads", std::vector<int64_t>{kLargeDimension - 1, kLargeDimension - 1});
+  test.AddInput<float>("X", {1, 0, kLargeDimension}, {});
+  test.AddInput<float>("W", {0, 1, kLargeDimension}, {});
+  test.AddOutput<float>("Y", {1, 1, 1}, {0.0f});
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCpuExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
+TEST(ConvTransposeTest, ZeroInputChannelsFillOutputWithBias) {
+  OpTester test("ConvTranspose", 11);
+  test.AddAttribute("kernel_shape", std::vector<int64_t>{1});
+  test.AddInput<float>("X", {2, 0, 2}, {});
+  test.AddInput<float>("W", {0, 3, 1}, {});
+  test.AddInput<float>("B", {3}, {1.0f, 2.0f, 3.0f});
+  test.AddOutput<float>("Y", {2, 3, 2},
+                        {1.0f, 1.0f, 2.0f, 2.0f, 3.0f, 3.0f,
+                         1.0f, 1.0f, 2.0f, 2.0f, 3.0f, 3.0f});
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCpuExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
 #if !defined(ORT_NO_EXCEPTIONS)
+TEST(ConvTransposeTest, NonzeroInputChannelsRejectColBufferSizeOverflow) {
+  constexpr size_t kNonzeroInputImageSize = 2;
+  constexpr size_t kOverflowingKernelDim = std::numeric_limits<size_t>::max();
+  EXPECT_ANY_THROW(::onnxruntime::conv_transpose_internal::CalculateColBufferSize(
+      sizeof(float), kOverflowingKernelDim, kNonzeroInputImageSize));
+}
+
 // Test that extreme attribute values causing arithmetic overflow are caught.
 // SafeInt throws on overflow; in no-exceptions builds this aborts, so skip there.
 TEST(ConvTransposeTest, ConvTranspose_OverflowInPadComputation) {
@@ -2088,6 +2169,307 @@ TEST(ConvTransposeTest, ConvTranspose_OverflowInExplicitOutputShapePath) {
             kCudaExecutionProvider, kCudaNHWCExecutionProvider, kWebGpuExecutionProvider});
 }
 #endif  // !defined(ORT_NO_EXCEPTIONS)
+
+// ---- Wide-channel ConvTranspose (WebGPU GEMM + col2im path) -------------------------------------------
+// The WebGPU EP lowers group-1 1D/2D ConvTranspose to a GEMM followed by col2im when each output gathers
+// at least 256 taps (C_in * ceil(kH / sH) * ceil(kW / sW)) in float32, or from 16 input channels in
+// float16; these cases compare it (and every other EP) against a double-precision reference.
+
+namespace {
+
+struct WideConvTransposeCase {
+  int64_t batch, in_channels, out_channels, in_height, in_width;  // in_height 0 selects ConvTranspose1D
+  int64_t kernel_h, kernel_w, stride_h, stride_w, dilation_h, dilation_w;
+  int64_t pad_top, pad_left, pad_bottom, pad_right, output_padding_h, output_padding_w;
+  bool has_bias;
+};
+
+// Runs one ConvTranspose on the WebGPU EP alone with a reduced storage binding size, with the weights
+// both as initializers (prepacked) and as graph inputs.
+template <typename T>
+void RunConvTransposeOnLimitedWebGpu(const ConvTransposeOpAttributes& attrs, const std::vector<std::vector<T>>& inputs,
+                                     const std::vector<std::vector<int64_t>>& shapes, const std::vector<T>& expected,
+                                     const std::vector<int64_t>& output_shape, uint64_t binding_limit,
+                                     float rel_error, float abs_error) {
+  for (const bool initializer : {true, false}) {
+    WebGpuExecutionProviderTestOptions options{};
+    options.max_storage_buffer_binding_size = binding_limit;
+    auto webgpu = WebGpuExecutionProviderWithTestOptions(options);
+    if (webgpu == nullptr) {
+      GTEST_SKIP() << "Needs the WebGPU execution provider.";
+    }
+    OpTester test("ConvTranspose", 11);
+    test.AddAttribute("kernel_shape", attrs.kernel_shape);
+    test.AddAttribute("group", attrs.group);
+    test.AddAttribute("pads", attrs.pads);
+    test.AddAttribute("output_padding", attrs.output_padding);
+    test.AddAttribute("strides", attrs.strides);
+    test.AddAttribute("dilations", attrs.dilations);
+    const char* names[] = {"X", "W", "B"};
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      test.AddInput<T>(names[i], shapes[i], inputs[i], i > 0 && initializer);
+    }
+    test.AddOutput<T>("Y", output_shape, expected, false, rel_error, abs_error);
+    std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+    execution_providers.push_back(std::move(webgpu));
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+  }
+}
+
+// `webgpu_binding_limit`, when set, runs only the WebGPU EP with that storage binding size.
+void TestWideConvTranspose(const WideConvTransposeCase& c, bool fp16 = false, uint64_t webgpu_binding_limit = 0) {
+  const bool is_1d = c.in_height == 0;
+  const int64_t h = is_1d ? 1 : c.in_height;
+  const int64_t kh = is_1d ? 1 : c.kernel_h;
+  const int64_t sh = is_1d ? 1 : c.stride_h;
+  const int64_t dh = is_1d ? 1 : c.dilation_h;
+  const int64_t pt = is_1d ? 0 : c.pad_top;
+  const int64_t pb = is_1d ? 0 : c.pad_bottom;
+  const int64_t oph = is_1d ? 0 : c.output_padding_h;
+  const int64_t oh = sh * (h - 1) + oph + (kh - 1) * dh + 1 - pt - pb;
+  const int64_t ow = c.stride_w * (c.in_width - 1) + c.output_padding_w + (c.kernel_w - 1) * c.dilation_w + 1 -
+                     c.pad_left - c.pad_right;
+
+  std::mt19937 rng(static_cast<uint32_t>(c.in_channels * 131 + c.kernel_w * 7 + c.out_channels));
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  auto random = [&](int64_t n) {
+    std::vector<float> v(static_cast<size_t>(n));
+    for (auto& x : v) x = dist(rng);
+    return v;
+  };
+  const std::vector<float> x = random(c.batch * c.in_channels * h * c.in_width);
+  const std::vector<float> w = random(c.in_channels * c.out_channels * kh * c.kernel_w);
+  const std::vector<float> b = random(c.out_channels);
+
+  std::vector<double> y(static_cast<size_t>(c.batch * c.out_channels * oh * ow), 0.0);
+  for (int64_t n = 0; n < c.batch; ++n) {
+    for (int64_t co = 0; co < c.out_channels; ++co) {
+      for (int64_t y_h = 0; y_h < oh; ++y_h) {
+        for (int64_t y_w = 0; y_w < ow; ++y_w) {
+          y[static_cast<size_t>(((n * c.out_channels + co) * oh + y_h) * ow + y_w)] = c.has_bias ? b[co] : 0.0;
+        }
+      }
+    }
+    for (int64_t ci = 0; ci < c.in_channels; ++ci) {
+      for (int64_t ih = 0; ih < h; ++ih) {
+        for (int64_t iw = 0; iw < c.in_width; ++iw) {
+          const double xv = x[static_cast<size_t>(((n * c.in_channels + ci) * h + ih) * c.in_width + iw)];
+          for (int64_t co = 0; co < c.out_channels; ++co) {
+            for (int64_t k_h = 0; k_h < kh; ++k_h) {
+              const int64_t y_h = ih * sh + k_h * dh - pt;
+              if (y_h < 0 || y_h >= oh) continue;
+              for (int64_t k_w = 0; k_w < c.kernel_w; ++k_w) {
+                const int64_t y_w = iw * c.stride_w + k_w * c.dilation_w - c.pad_left;
+                if (y_w < 0 || y_w >= ow) continue;
+                const double wv = w[static_cast<size_t>(((ci * c.out_channels + co) * kh + k_h) * c.kernel_w + k_w)];
+                y[static_cast<size_t>(((n * c.out_channels + co) * oh + y_h) * ow + y_w)] += xv * wv;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  std::vector<float> expected(y.size());
+  std::transform(y.begin(), y.end(), expected.begin(), [](double v) { return static_cast<float>(v); });
+
+  ConvTransposeOpAttributes attrs;
+  std::vector<std::vector<int64_t>> shapes;
+  if (is_1d) {
+    attrs = {{c.kernel_w}, {c.output_padding_w}, {}, {c.pad_left, c.pad_right}, {c.stride_w}, {c.dilation_w}, 1, ""};
+    shapes = {{c.batch, c.in_channels, c.in_width}, {c.in_channels, c.out_channels, c.kernel_w}};
+  } else {
+    attrs = {{kh, c.kernel_w},
+             {oph, c.output_padding_w},
+             {},
+             {pt, c.pad_left, pb, c.pad_right},
+             {sh, c.stride_w},
+             {dh, c.dilation_w},
+             1,
+             ""};
+    shapes = {{c.batch, c.in_channels, h, c.in_width}, {c.in_channels, c.out_channels, kh, c.kernel_w}};
+  }
+  std::vector<std::vector<float>> inputs = {x, w};
+  if (c.has_bias) {
+    inputs.push_back(b);
+    shapes.push_back({c.out_channels});
+  }
+  const std::vector<int64_t> output_shape =
+      is_1d ? std::vector<int64_t>{c.batch, c.out_channels, ow} : std::vector<int64_t>{c.batch, c.out_channels, oh, ow};
+  std::unordered_set<std::string> excluded{kCudaNHWCExecutionProvider, kTensorrtExecutionProvider,
+                                           kQnnExecutionProvider};
+  if (fp16) {
+    // The XNNPACK float16 deconvolution misses the bias on these shapes.
+    excluded.insert(kXnnpackExecutionProvider);
+  }
+  const bool has_pads_dilation_output_padding = c.pad_left != 0 || c.pad_right != 0 || c.pad_top != 0 ||
+                                                c.pad_bottom != 0 || c.dilation_w != 1 || c.dilation_h > 1 ||
+                                                c.output_padding_w != 0 || c.output_padding_h != 0;
+  if (has_pads_dilation_output_padding && dynamic_plugin_ep_infra::GetEpName().has_value()) {
+    // The CUDA plugin EP on Windows gets these padded, dilated cases wrong; the built-in CUDA EP passes.
+    excluded.insert(kCudaExecutionProvider);
+  }
+  if (webgpu_binding_limit != 0) {
+    if (fp16) {
+      std::vector<std::vector<MLFloat16>> inputs16;
+      for (const auto& input : inputs) inputs16.push_back(ToFloat16(input));
+      RunConvTransposeOnLimitedWebGpu(attrs, inputs16, shapes, ToFloat16(expected), output_shape,
+                                      webgpu_binding_limit, 2e-2f, 5e-2f);
+    } else {
+      RunConvTransposeOnLimitedWebGpu(attrs, inputs, shapes, expected, output_shape, webgpu_binding_limit, 1e-4f,
+                                      1e-3f);
+    }
+  } else if (fp16) {
+    std::vector<std::vector<MLFloat16>> inputs16;
+    for (const auto& input : inputs) inputs16.push_back(ToFloat16(input));
+    TestConvTransposeOp(attrs, inputs16, shapes, ToFloat16(expected), output_shape,
+                        OpTester::ExpectResult::kExpectSuccess, "", excluded, /*rel_error=*/2e-2f,
+                        /*abs_error=*/5e-2f);
+  } else {
+    // The CUDA EP may run these wide convolutions in TF32, which drifts by a few 1e-3.
+    TestConvTransposeOp(attrs, inputs, shapes, expected, output_shape, OpTester::ExpectResult::kExpectSuccess, "",
+                        excluded, /*rel_error=*/1e-4f, /*abs_error=*/1e-2f);
+  }
+}
+
+}  // namespace
+
+TEST(ConvTransposeTest, WideChannels1D_Strided) {
+  // batch, C_in, C_out, H, W, kH, kW, sH, sW, dH, dW, pads (t, l, b, r), output_padding (h, w), bias
+  TestWideConvTranspose({2, 128, 3, 0, 37, 0, 8, 0, 4, 0, 1, 0, 0, 0, 0, 0, 0, true});
+}
+
+TEST(ConvTransposeTest, WideChannels1D_InverseStftLike) {
+  // C_in not a multiple of 4 and one output channel, like an iSTFT written as ConvTranspose.
+  TestWideConvTranspose({3, 130, 1, 0, 20, 0, 64, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0, false});
+}
+
+TEST(ConvTransposeTest, WideChannels1D_PadsDilationOutputPadding) {
+  TestWideConvTranspose({1, 129, 5, 0, 23, 0, 5, 0, 3, 0, 2, 0, 3, 0, 1, 0, 2, true});
+}
+
+TEST(ConvTransposeTest, WideChannels2D_DecoderLike) {
+  TestWideConvTranspose({1, 128, 7, 9, 13, 8, 1, 4, 1, 1, 1, 0, 0, 0, 0, 0, 0, true});
+}
+
+TEST(ConvTransposeTest, WideChannels2D_PadsDilationOutputPadding) {
+  TestWideConvTranspose({2, 68, 5, 6, 7, 3, 4, 2, 3, 1, 2, 1, 0, 2, 1, 1, 0, true});
+}
+
+TEST(ConvTransposeTest, WideChannels1D_Float16) {
+  TestWideConvTranspose({2, 32, 6, 0, 50, 0, 8, 0, 4, 0, 1, 0, 0, 0, 0, 0, 0, true}, /*fp16=*/true);
+}
+
+TEST(ConvTransposeTest, WideChannels1D_LargeInput) {
+  TestWideConvTranspose({2, 128, 12, 0, 6000, 0, 8, 0, 4, 0, 1, 0, 0, 0, 0, 0, 0, true});
+}
+
+// A 150 KB binding limit splits the 500 KB column buffer of these 1000 input rows into row chunks of
+// 300, 300, 300 and 100. Each output pixel gathers 16 taps from consecutive rows, so contributions
+// straddle every chunk boundary, and the bias must be added once.
+constexpr uint64_t kChunkedBindingLimit = 600 * 256;
+const WideConvTransposeCase kChunkedCase{2, 16, 4, 0, 500, 0, 32, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, true};
+
+TEST(ConvTransposeTest, WideChannels1D_ChunkedColumns) {
+  TestWideConvTranspose(kChunkedCase, /*fp16=*/false, kChunkedBindingLimit);
+}
+
+TEST(ConvTransposeTest, WideChannels1D_ChunkedColumnsFloat16) {
+  TestWideConvTranspose(kChunkedCase, /*fp16=*/true, kChunkedBindingLimit);
+}
+
+// 2D column chunks of 100 rows (384 columns of 4 bytes each): with 250 input pixels per row, some
+// chunks stay within one input row and others span two, and the second case has chunks spanning two
+// batches. Each chunk only gathers into the output box it reaches.
+const WideConvTransposeCase kChunked2DCase{1, 16, 4, 2, 250, 3, 32, 2, 2, 2, 1, 1, 2, 0, 3, 1, 1, true};
+const WideConvTransposeCase kChunked2DBatchesCase{2, 16, 4, 3, 50, 3, 32, 1, 2, 1, 1, 0, 0, 0, 0, 0, 0, false};
+
+TEST(ConvTransposeTest, WideChannels2D_ChunkedColumns) {
+  TestWideConvTranspose(kChunked2DCase, /*fp16=*/false, kChunkedBindingLimit);
+  TestWideConvTranspose(kChunked2DBatchesCase, /*fp16=*/false, kChunkedBindingLimit);
+}
+
+TEST(ConvTransposeTest, WideChannels2D_ChunkedColumnsFloat16) {
+  TestWideConvTranspose(kChunked2DCase, /*fp16=*/true, kChunkedBindingLimit);
+}
+
+// float16 with column chunks whose f32 accumulator would exceed the binding limit: the output is gathered
+// in one pass from X and the packed weights. The 1D output takes 250 KB in f32 against a 150 KB limit;
+// the 2D case takes 58 KB in f32 against a 50 KB limit, with pads, dilation and output padding.
+TEST(ConvTransposeTest, WideChannels_FusedGatherFloat16) {
+  TestWideConvTranspose({1, 16, 4, 0, 2000, 0, 32, 0, 8, 0, 1, 0, 0, 0, 0, 0, 0, true}, /*fp16=*/true,
+                        kChunkedBindingLimit);
+  TestWideConvTranspose(kChunked2DCase, /*fp16=*/true, /*webgpu_binding_limit=*/50000);
+}
+
+// A float16 filter whose f32 GEMM packing (128 KB) exceeds the binding limit while the original (64 KB)
+// fits keeps the direct kernel, whether prepacked or not.
+TEST(ConvTransposeTest, WideChannels1D_PackedFilterOverLimitFloat16) {
+  TestWideConvTranspose({1, 32, 8, 0, 10, 0, 128, 0, 64, 0, 1, 0, 0, 0, 0, 0, 0, true}, /*fp16=*/true,
+                        /*webgpu_binding_limit=*/100000);
+}
+
+// Per-tap partial sums that do not fit float16 but cancel across taps: every one of the 16 input
+// channels is 1 and has taps {2048, -4096, 2048}, so the middle tap alone sums to -65536 (beyond the
+// float16 range) while each output is exactly 0.
+TEST(ConvTransposeTest, WideChannels1D_Float16CancellingTaps) {
+  auto webgpu = DefaultWebGpuExecutionProvider();
+  if (webgpu == nullptr) {
+    GTEST_SKIP() << "Needs the WebGPU execution provider.";
+  }
+  constexpr int64_t channels = 16;
+  std::vector<float> w;
+  for (int64_t c = 0; c < channels; ++c) w.insert(w.end(), {2048.0f, -4096.0f, 2048.0f});
+  OpTester test("ConvTranspose", 11);
+  test.AddAttribute("kernel_shape", std::vector<int64_t>{3});
+  test.AddAttribute("pads", std::vector<int64_t>{2, 2});
+  test.AddInput<MLFloat16>("X", {1, channels, 5}, ToFloat16(std::vector<float>(channels * 5, 1.0f)));
+  test.AddInput<MLFloat16>("W", {channels, 1, 3}, ToFloat16(w), true);
+  test.AddOutput<MLFloat16>("Y", {1, 1, 3}, ToFloat16({0.0f, 0.0f, 0.0f}));
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(std::move(webgpu));
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
+// Empty inputs on both sides of the GEMM cutoff (16 input channels take the direct kernel, 96 the GEMM in
+// float32), with initializer and runtime weights, with and without bias. An empty spatial input still
+// gives a non-empty output, which holds the bias of each channel (or zeros); an empty batch gives an
+// empty output.
+TEST(ConvTransposeTest, WideChannels1D_EmptyInput) {
+  for (const int64_t channels : {16, 96}) {
+    for (const bool empty_batch : {false, true}) {
+      for (const bool has_bias : {true, false}) {
+        for (const bool initializer : {true, false}) {
+          auto webgpu = DefaultWebGpuExecutionProvider();
+          if (webgpu == nullptr) {
+            GTEST_SKIP() << "Needs the WebGPU execution provider.";
+          }
+          OpTester test("ConvTranspose", 11);
+          test.AddAttribute("kernel_shape", std::vector<int64_t>{3});
+          if (empty_batch) {
+            test.AddInput<float>("X", {0, channels, 5}, {});
+          } else {
+            test.AddInput<float>("X", {1, channels, 0}, {});
+          }
+          test.AddInput<float>("W", {channels, 2, 3}, std::vector<float>(static_cast<size_t>(channels * 6), 1.0f),
+                               initializer);
+          if (has_bias) {
+            test.AddInput<float>("B", {2}, {7.0f, -3.0f}, initializer);
+          }
+          if (empty_batch) {
+            test.AddOutput<float>("Y", {0, 2, 7}, {});
+          } else {
+            test.AddOutput<float>("Y", {1, 2, 2},
+                                  has_bias ? std::vector<float>{7.0f, 7.0f, -3.0f, -3.0f} : std::vector<float>(4, 0.0f));
+          }
+          std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+          execution_providers.push_back(std::move(webgpu));
+          test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+        }
+      }
+    }
+  }
+}
 
 }  // namespace test
 }  // namespace onnxruntime

@@ -4,11 +4,13 @@
 #if !defined(ORT_MINIMAL_BUILD)
 
 #include "core/session/provider_policy_context.h"
+#include "core/platform/telemetry_strings.h"
 
 #include <algorithm>
 #include <memory>
 #include <utility>
 
+#include "core/common/inlined_containers.h"
 #include "core/framework/error_code_helper.h"
 #include "core/session/abi_devices.h"
 #include "core/session/abi_logger.h"
@@ -218,30 +220,32 @@ Status ProviderPolicyContext::SelectEpDevices(std::vector<const OrtEpDevice*>& e
 }
 
 Status ProviderPolicyContext::LogTelemetry(InferenceSession& sess,
-                                           const OrtSessionOptions& options,
+                                           const EpSelectionPolicy& policy,
                                            const std::vector<const OrtEpDevice*>& execution_devices,
                                            const std::vector<const OrtEpDevice*>& devices_selected) {
   std::vector<std::string> requested_ep_ids;
-  requested_ep_ids.reserve(devices_selected.size());
+  requested_ep_ids.reserve(std::min(devices_selected.size(), telemetry_detail::kMaxTelemetryCollectionEntries));
 
   for (const auto* device : devices_selected) {
+    if (requested_ep_ids.size() == telemetry_detail::kMaxTelemetryCollectionEntries) break;
     if (device != nullptr) {
-      requested_ep_ids.push_back(device->ep_name);
+      requested_ep_ids.push_back(telemetry_detail::BoundedTelemetryString(device->ep_name));
     }
   }
 
   // Extract available execution provider IDs
   std::vector<std::string> available_ep_ids;
-  available_ep_ids.reserve(execution_devices.size());
+  available_ep_ids.reserve(std::min(execution_devices.size(), telemetry_detail::kMaxTelemetryCollectionEntries));
   for (const auto* device : execution_devices) {
-    available_ep_ids.push_back(device->ep_name);
+    if (available_ep_ids.size() == telemetry_detail::kMaxTelemetryCollectionEntries) break;
+    available_ep_ids.push_back(telemetry_detail::BoundedTelemetryString(device->ep_name));
   }
 
   std::string policy_type;
-  if (options.value.ep_selection_policy.delegate) {
+  if (policy.delegate) {
     policy_type = "custom_delegate";
   } else {
-    switch (options.value.ep_selection_policy.policy) {
+    switch (policy.policy) {
       case OrtExecutionProviderDevicePolicy_DEFAULT:
         policy_type = "DEFAULT";
         break;
@@ -320,7 +324,8 @@ Status ProviderPolicyContext::SelectEpsForModelPackage(const Environment& env,
                                                        OrtKeyValuePairs& model_metadata,
                                                        std::vector<const OrtEpDevice*>& execution_devices,
                                                        std::vector<const OrtEpDevice*>& devices_selected,
-                                                       std::vector<std::unique_ptr<IExecutionProvider>>& providers) {
+                                                       std::vector<std::unique_ptr<IExecutionProvider>>& providers,
+                                                       InlinedVector<SelectionInfo>& provider_selections) {
   // Get the list of devices from the environment and order them.
   // Ordered by preference within each type. NPU -> GPU -> NPU
   // TODO: Should environment.cc do the ordering?
@@ -353,6 +358,7 @@ Status ProviderPolicyContext::SelectEpsForModelPackage(const Environment& env,
                                                 eps_selected[idx], ep));
     if (ep != nullptr) {
       providers.push_back(std::move(ep));
+      provider_selections.push_back(std::move(eps_selected[idx]));
     }
   }
 
@@ -374,7 +380,7 @@ Status ProviderPolicyContext::SelectEpsForSession(const Environment& env, const 
   ORT_RETURN_IF_ERROR(SelectEpDevices(execution_devices, options, model_metadata, devices_selected));
 
   // Log telemetry for auto EP selection
-  ORT_RETURN_IF_ERROR(LogTelemetry(sess, options, execution_devices, devices_selected));
+  ORT_RETURN_IF_ERROR(LogTelemetry(sess, options.value.ep_selection_policy, execution_devices, devices_selected));
 
   // Configure the session options for the devices. This updates the SessionOptions in the InferenceSession with any
   // EP options that have not been overridden by the user.

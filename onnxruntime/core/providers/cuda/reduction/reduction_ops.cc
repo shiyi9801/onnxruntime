@@ -527,9 +527,10 @@ Status ReduceComputeCore(const AllocatorPtr& gpu_allocator, const CudaKernel* ke
   cudnnDataType_t cudnn_type_X = CUDNN_DATA_FLOAT;
 
   // Reducesum with BFP16 is not supported by cudnn, so convert input to fp32 then call cudnn
-  if ((ReduceTensorIndices == CUDNN_REDUCE_TENSOR_FLATTENED_INDICES && std::is_same<T, MLFloat16>::value) ||
+  if ((ReduceTensorIndices == CUDNN_REDUCE_TENSOR_FLATTENED_INDICES &&
+       (std::is_same<T, MLFloat16>::value || std::is_same<T, BFloat16>::value)) ||
       (ReduceTensorIndices == CUDNN_REDUCE_TENSOR_NO_INDICES && std::is_same<T, BFloat16>::value)) {
-    // ArgMax/ArgMin with FP16 are not supported by cudnn, so convert input to fp32 then call cudnn
+    // ArgMax/ArgMin with FP16/BF16 are not supported by cudnn, so convert input to fp32 then call cudnn
     temp_X = AllocateScratchBuffer<float>(gpu_allocator, kernel, input_count, compute_stream);
     Impl_Cast<CudaT, float>(stream, reinterpret_cast<const CudaT*>(input.Data<T>()), temp_X.get(), input_shape.Size());
   } else {
@@ -975,7 +976,8 @@ template <typename T, cudnnReduceTensorIndices_t ReduceTensorIndices>
 std::unique_ptr<Tensor> ReduceCompute(const AllocatorPtr& gpu_allocator, cudnnReduceTensorOp_t cudnn_reduce_op, AllocatorPtr allocator,
                                       const Tensor& input, gsl::span<const int64_t> axes,
                                       bool keep_dims, bool calculate_log, bool calculate_sqt, bool log_sum_exp,
-                                      bool fast_reduction, Stream* stream, cudnnHandle_t cudnn_handle,
+                                      bool fast_reduction, Stream* stream, Stream* alloc_stream,
+                                      cudnnHandle_t cudnn_handle,
                                       const TensorShape* input_shape_override) {
   PrepareReduceMetadata prepare_reduce_metadata;
   auto status = PrepareForReduce(&input,
@@ -988,12 +990,14 @@ std::unique_ptr<Tensor> ReduceCompute(const AllocatorPtr& gpu_allocator, cudnnRe
     ORT_THROW(ONNXRUNTIME, FAIL, "Failed to perform reduce op: ", status.ErrorMessage());
   }
 
-  auto output = Tensor::Create(input.DataType(), prepare_reduce_metadata.squeezed_output_dims, allocator);
+  auto output = Tensor::Create(input.DataType(), prepare_reduce_metadata.squeezed_output_dims, allocator, alloc_stream);
 
+  // ReduceComputeCore only uses its `compute_stream` to tag allocations, so it gets `alloc_stream`
+  // too. The launches take the native handle off `stream`.
   status = ReduceComputeCore<T, ReduceTensorIndices>(gpu_allocator, nullptr, input, prepare_reduce_metadata, *output, cudnn_reduce_op, axes,
                                                      calculate_log, calculate_sqt, log_sum_exp, fast_reduction,
                                                      stream ? static_cast<cudaStream_t>(stream->GetHandle()) : nullptr,
-                                                     static_cast<void*>(stream), cudnn_handle,
+                                                     static_cast<void*>(alloc_stream), cudnn_handle,
                                                      input_shape_override);
 
   if (!status.IsOK()) {
@@ -1010,31 +1014,36 @@ template std::unique_ptr<Tensor> ReduceCompute<float, CUDNN_REDUCE_TENSOR_NO_IND
     AllocatorPtr allocator,
     const Tensor& input, gsl::span<const int64_t> axes,
     bool keep_dims, bool calculate_log, bool calculate_sqt, bool log_sum_exp,
-    bool fast_reduction, Stream* stream, cudnnHandle_t cudnn_handle, const TensorShape* input_shape_override);
+    bool fast_reduction, Stream* stream, Stream* alloc_stream, cudnnHandle_t cudnn_handle,
+    const TensorShape* input_shape_override);
 
 template std::unique_ptr<Tensor> ReduceCompute<double, CUDNN_REDUCE_TENSOR_NO_INDICES>(
     const AllocatorPtr& gpu_allocator, cudnnReduceTensorOp_t cudnn_reduce_op,
     AllocatorPtr allocator,
     const Tensor& input, gsl::span<const int64_t> axes,
     bool keep_dims, bool calculate_log, bool calculate_sqt, bool log_sum_exp,
-    bool fast_reduction, Stream* stream, cudnnHandle_t cudnn_handle, const TensorShape* input_shape_override);
+    bool fast_reduction, Stream* stream, Stream* alloc_stream, cudnnHandle_t cudnn_handle,
+    const TensorShape* input_shape_override);
 
 template std::unique_ptr<Tensor> ReduceCompute<MLFloat16, CUDNN_REDUCE_TENSOR_NO_INDICES>(
     const AllocatorPtr& gpu_allocator, cudnnReduceTensorOp_t cudnn_reduce_op,
     AllocatorPtr allocator,
     const Tensor& input, gsl::span<const int64_t> axes,
     bool keep_dims, bool calculate_log, bool calculate_sqt, bool log_sum_exp,
-    bool fast_reduction, Stream* stream, cudnnHandle_t cudnn_handle, const TensorShape* input_shape_override);
+    bool fast_reduction, Stream* stream, Stream* alloc_stream, cudnnHandle_t cudnn_handle,
+    const TensorShape* input_shape_override);
 
 }  // namespace ReductionOps
 
 REGISTER_KERNEL_ARGMIN_OR_ARGMAX(ArgMax, MLFloat16)
 REGISTER_KERNEL_ARGMIN_OR_ARGMAX(ArgMax, float)
 REGISTER_KERNEL_ARGMIN_OR_ARGMAX(ArgMax, double)
+REGISTER_KERNEL_VERSIONED_SINCE_TYPED(ArgMax, BFloat16, 13)
 
 REGISTER_KERNEL_ARGMIN_OR_ARGMAX(ArgMin, MLFloat16)
 REGISTER_KERNEL_ARGMIN_OR_ARGMAX(ArgMin, float)
 REGISTER_KERNEL_ARGMIN_OR_ARGMAX(ArgMin, double)
+REGISTER_KERNEL_VERSIONED_SINCE_TYPED(ArgMin, BFloat16, 13)
 
 REGISTER_KERNEL_VERSIONED_RANGE_TYPED(ReduceMax, MLFloat16, 1, 17)
 REGISTER_KERNEL_VERSIONED_RANGE_TYPED(ReduceMax, float, 1, 17)
